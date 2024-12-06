@@ -36,14 +36,11 @@ def transcribe_audio(audio_url):
 # Function to extract task details using LLM
 def extract_task_details_llm(transcript_obj):
     """
-    Extracts structured task details (task, with_whom, time, location, agenda, duration, participants) from transcript using an LLM.
-    Attempts to infer or fill in missing details where possible.
+    Extracts structured task details (task, with whom, at what time) from transcript using an LLM.
     """
     prompt = (
         "Understand the following text and extract structured information about a task. "
-        "Return only a JSON object with the following fields: "
-        "'task', 'with_whom', 'time', 'location', 'agenda', 'duration', 'participants'. "
-        "If any field is not mentioned in the text, set it to 'N/A'. "
+        "Return only a JSON object with the following fields: 'task', 'with_whom', and 'time'. "
         "Do not include any additional text or explanations.\n\n"
         f"Text: {transcript_obj.text}\n\n"
         "Response:"
@@ -61,18 +58,10 @@ def extract_task_details_llm(transcript_obj):
         # Ensure response is JSON formatted
         try:
             structured_response = json.loads(result.response)
-            # Replace any None values with 'N/A'
-            for key, value in structured_response.items():
-                if value is None:
-                    structured_response[key] = "N/A"
             return structured_response
         except json.JSONDecodeError:
             print("Response is not in JSON format. Parsing manually.")
             structured_response = parse_text_response(result.response)
-            # Replace any None values with 'N/A'
-            for key, value in structured_response.items():
-                if value is None:
-                    structured_response[key] = "N/A"
             return structured_response
     except Exception as e:
         print("LLM processing failed:", e)
@@ -97,118 +86,100 @@ def parse_text_response(response_text):
         json_str = json_str[:json_end]
 
         data = json.loads(json_str)
-        # Replace any None values with 'N/A'
-        for key, value in data.items():
-            if value is None:
-                data[key] = "N/A"
         return data
     except Exception as e:
         print(f"Error parsing text response: {e}")
         return {}
 
-# Function to validate and format time input
-def validate_time(time_str):
+# Function to generate clarifying questions
+def generate_clarifying_questions(transcript_obj, task_details):
     """
-    Validates and formats the time string.
+    Uses the LLM to generate contextual and meaningful clarifying questions 
+    based on missing task details and inferred context.
     """
-    if not time_str:
-        print("No time provided. Setting to 'N/A'.")
-        return "N/A"
-    
-    if isinstance(time_str, str) and time_str.strip().upper() == "N/A":
-        # Recognize 'N/A' as a valid default and skip validation
-        return "N/A"
-    
-    time_pattern = re.compile(r'^(1[0-2]|0?[1-9]):([0-5][0-9])\s?(AM|PM|am|pm)$')
-    match = time_pattern.match(time_str)
-    if match:
-        # Convert to uppercase for consistency
-        hour = int(match.group(1))
-        minute = match.group(2)
-        period = match.group(3).upper()
-        return f"{hour}:{minute} {period}"
-    else:
-        print("Invalid time format detected in the LLM response. Setting to 'N/A'.")
-        return "N/A"
-
-def get_field_value(field_value, field_name):
-    """
-    Returns the field value if present; otherwise, returns 'N/A'.
-    """
-    if not field_value:
-        print(f"No {field_name} provided. Setting to 'N/A'.")
-        return "N/A"
-    return field_value
-
-def prompt_for_missing_fields(task_details):
-    """
-    Prompts the user to input missing fields that are set to 'N/A'.
-    """
-    fields_to_prompt = ['time', 'location', 'agenda', 'duration', 'participants']
-    for field in fields_to_prompt:
-        if task_details.get(field) == "N/A":
-            user_input = input(f"Please provide the {field} for the task '{task_details.get('task', 'N/A')}' (or type 'skip' to leave as 'N/A'): ").strip()
-            if user_input.lower() != 'skip' and user_input:
-                # Optionally, enhance the user input using LLM
-                enhanced_input = enhance_input_with_llm(field, user_input)
-                task_details[field] = enhanced_input
-            else:
-                print(f"Leaving {field} as 'N/A'.")
-    return task_details
-
-def enhance_input_with_llm(field, user_input):
-    """
-    Enhances the user's input using the LLM to ensure consistency and quality.
-    """
+    # Identify missing or ambiguous fields
+    existing_fields = task_details.keys()
     prompt = (
-        f"Improve the following {field} information for a calendar event:\n\n"
-        f"Original {field}: {user_input}\n\n"
-        "Enhanced:"
+        f"The extracted task details are incomplete or ambiguous:\n"
+        f"{json.dumps(task_details, indent=2)}\n\n"
+        "Please generate clarifying questions to gather more information "
+        "about the task. These questions should help make the event more detailed"
+        "Return the questions as a JSON array. Do not include any explanations."
     )
-    
-    try:
-        print(f"Enhancing the {field} with LLM...")
-        # Adjust the method based on AssemblyAI's API for LLM interaction
-        # This is a placeholder and may need to be modified
-        response = aai.LemurModel.claude3_5_sonnet.complete(prompt)
-        enhanced_response = response.text.strip()
-        print(f"Enhanced {field}: {enhanced_response}")
-        return enhanced_response
-    except Exception as e:
-        print(f"Failed to enhance {field} with LLM: {e}")
-        return user_input  # Fallback to original input if enhancement fails
 
-# Function to add task to a calendar
-def add_task_to_calendar(task_details):
+    try:
+        print("Generating clarifying questions with LLM...")
+        result = transcript_obj.lemur.task(
+            prompt, final_model=aai.LemurModel.claude3_5_sonnet
+        )
+        print("Raw LLM Clarifying Questions Response:", result.response)
+
+        # Parse the JSON response
+        questions = json.loads(result.response)
+        return questions if isinstance(questions, list) else []
+    except Exception as e:
+        print("Failed to generate clarifying questions:", e)
+        return []
+
+# Function to dynamically update task details
+def answer_clarifying_questions(questions):
     """
-    Creates a formatted calendar event representation of the extracted task details.
+    Asks the user the clarifying questions generated by the LLM.
+    Dynamically updates the task_details dictionary with new fields.
     """
-    # Validate and format the time field if possible
-    task_details['time'] = validate_time(task_details.get('time', 'N/A'))
-    
-    # Handle other fields
-    task_details['with_whom'] = get_field_value(task_details.get('with_whom'), 'with_whom')
-    task_details['location'] = get_field_value(task_details.get('location'), 'location')
-    task_details['agenda'] = get_field_value(task_details.get('agenda'), 'agenda')
-    task_details['duration'] = get_field_value(task_details.get('duration'), 'duration')
-    
-    # Ensure participants is a list and not empty
-    participants = task_details.get('participants', [])
-    if isinstance(participants, str):
-        participants = [participant.strip() for participant in participants.split(',') if participant.strip()]
-    if not participants:
-        participants = ["N/A"]
-    task_details['participants'] = participants
-    
-    print("\n=== Calendar Event ===")
-    print(f"Task: {task_details.get('task', 'N/A')}")
-    print(f"With Whom: {task_details.get('with_whom', 'N/A')}")
-    print(f"Time: {task_details.get('time', 'N/A')}")
-    print(f"Location: {task_details.get('location', 'N/A')}")
-    print(f"Agenda: {task_details.get('agenda', 'N/A')}")
-    print(f"Duration: {task_details.get('duration', 'N/A')}")
-    print(f"Participants: {', '.join(task_details.get('participants', ['N/A']))}")
-    print("======================")
+    answers = {}
+    for question in questions:
+        # Ask the user for input
+        answer = input(f"{question.strip()} ").strip()
+
+        # Dynamically infer the key from the question
+        inferred_key = None
+        if "time" in question.lower():
+            inferred_key = "time"
+        elif "where" in question.lower():
+            inferred_key = "location"
+        elif "participants" in question.lower() or "who" in question.lower():
+            inferred_key = "participants"
+        elif "purpose" in question.lower() or "agenda" in question.lower():
+            inferred_key = "agenda"
+        elif "duration" in question.lower() or "how long" in question.lower():
+            inferred_key = "duration"
+
+        # If a key is inferred, update the answers dictionary
+        if inferred_key:
+            answers[inferred_key] = answer
+        else:
+            # If no key is inferred, use a generic key
+            answers[f"custom_field_{len(answers)+1}"] = answer
+
+    return answers
+
+# Function to create a polished calendar-like event
+def create_calendar_event(task_details):
+    """
+    Constructs a clean and detailed calendar event.
+    """
+    task = task_details.get("task", "No task specified")
+    with_whom = task_details.get("with_whom", "Not specified")
+    time = task_details.get("time", "No time provided")
+    location = task_details.get("location", "Not specified")
+    participants = task_details.get("participants", "Not specified")
+    agenda = task_details.get("agenda", "Not specified")
+    duration = task_details.get("duration", "Not specified")
+
+    # Create a detailed calendar event string
+    event = (
+        f"\n=== Calendar Event ===\n"
+        f"Task: {task}\n"
+        f"With: {with_whom}\n"
+        f"Time: {time}\n"
+        f"Location: {location}\n"
+        f"Participants: {participants}\n"
+        f"Agenda: {agenda}\n"
+        f"Duration: {duration}\n"
+        f"======================"
+    )
+    return event
 
 # Main Function
 def main(audio_url):
@@ -227,23 +198,31 @@ def main(audio_url):
         return
 
     print("\nExtracted Task Details:")
-    print(json.dumps(task_details, indent=2))
+    print(task_details)
 
-    # Step 3: Prompt user for missing fields
-    task_details = prompt_for_missing_fields(task_details)
+    # Step 3: Generate clarifying questions
+    questions = generate_clarifying_questions(transcript_obj, task_details)
+    if questions:
+        print("\nClarifying Questions:")
+        for question in questions:
+            print(f"- {question}")
+
+        # Step 4: Answer clarifying questions
+        answers = answer_clarifying_questions(questions)
+        task_details.update(answers)
 
     print("\nUpdated Task Details:")
-    print(json.dumps(task_details, indent=2))
+    print(task_details)
 
-    # Step 4: Add to calendar or create a representation
-    add_task_to_calendar(task_details)
+    # Step 5: Create a polished calendar event
+    calendar_event = create_calendar_event(task_details)
+    print(calendar_event)
 
 # Example Usage
 if __name__ == "__main__":
     # List of audio files to process
-    audio_files = ["audio2.wav"]
+    audio_files = ["audio.wav"]
     
     for audio_file in audio_files:
         print(f"\nProcessing file: {audio_file}\n{'='*30}")
-        # Assuming audio_url is a valid URL or file path accessible by AssemblyAI
         main(audio_file)
