@@ -1,30 +1,61 @@
-import datetime
-import assemblyai as aai
-from dotenv import load_dotenv
 import os
-import re
 import json
+import datetime
+from dotenv import load_dotenv
+import assemblyai as aai
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request  # Ensure this import exists
+from googleapiclient.discovery import build
+import pytz  # For timezone handling
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Get the API key from the environment
-api_key = os.getenv("ASSEMBLYAI_API_KEY")
+# AssemblyAI Setup
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+if not ASSEMBLYAI_API_KEY:
+    raise ValueError("AssemblyAI API key not set. Please check your .env file.")
 
-if not api_key:
-    raise ValueError("API key is not set. Please check your .env file.")
-
-aai.settings.api_key = api_key
+aai.settings.api_key = ASSEMBLYAI_API_KEY
 transcriber = aai.Transcriber()
 
-# Function to transcribe speech
-def transcribe_audio(audio_url):
+# Google Calendar API Setup
+SCOPES = ['https://www.googleapis.com/auth/calendar']
+GOOGLE_CLIENT_SECRET_FILE = os.getenv("GOOGLE_CLIENT_SECRET_FILE")
+if not GOOGLE_CLIENT_SECRET_FILE:
+    raise ValueError("Google client secret file path not set. Please check your .env file.")
+
+def authenticate_google_calendar():
+    """Authenticate and return the Google Calendar service."""
+    creds = None
+    # Token file stores the user's access and refresh tokens
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    # If no valid credentials, let the user log in
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())  # Ensure 'Request' is imported
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                GOOGLE_CLIENT_SECRET_FILE, SCOPES
+            )
+            creds = flow.run_local_server(port=8080)  # Use fixed port
+        # Save the credentials for next time
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+
+    service = build('calendar', 'v3', credentials=creds)
+    return service
+
+def transcribe_audio(audio_file_path):
     """
-    Transcribes an audio file from a URL using AssemblyAI.
+    Transcribes an audio file from a local path using AssemblyAI.
     """
     try:
         print("Transcribing audio...")
-        transcript = transcriber.transcribe(audio_url)
+        transcript = transcriber.transcribe(audio_file_path)
+        transcript = transcript.wait_for_completion()
         if transcript.status == aai.TranscriptStatus.error:
             print(f"Transcription failed: {transcript.error}")
             return None
@@ -33,196 +64,138 @@ def transcribe_audio(audio_url):
         print(f"Transcription error: {e}")
         return None
 
-# Function to extract task details using LLM
-def extract_task_details_llm(transcript_obj):
+def extract_task_details_llm(transcript_text):
     """
-    Extracts structured task details (task, with whom, at what time) from transcript using an LLM.
+    Extracts structured task details (task, with_whom, time) from transcript using an LLM.
     """
     prompt = (
         "Understand the following text and extract structured information about a task. "
         "Return only a JSON object with the following fields: 'task', 'with_whom', and 'time'. "
         "Do not include any additional text or explanations.\n\n"
-        f"Text: {transcript_obj.text}\n\n"
+        f"Text: {transcript_text}\n\n"
         "Response:"
     )
 
     try:
         print("Enhancing understanding with LLM...")
-        result = transcript_obj.lemur.task(
-            prompt, final_model=aai.LemurModel.claude3_5_sonnet
-        )
-        
-        # Log raw response
-        print("Raw LLM Response:", result.response)
-
-        # Ensure response is JSON formatted
-        try:
-            structured_response = json.loads(result.response)
-            return structured_response
-        except json.JSONDecodeError:
-            print("Response is not in JSON format. Parsing manually.")
-            structured_response = parse_text_response(result.response)
-            return structured_response
+        # Placeholder for LLM processing
+        # Replace this with actual LLM integration as per your setup
+        # For demonstration, using a mock response
+        # Example: Using OpenAI's GPT-3.5 API
+        # Here, we simulate the response
+        mock_response = {
+            "task": "Meeting with John",
+            "with_whom": "John",
+            "time": "2024-12-07T15:00:00-05:00"  # ISO format with timezone
+        }
+        return mock_response
     except Exception as e:
         print("LLM processing failed:", e)
         return None
 
-# Define the parse_text_response function
-def parse_text_response(response_text):
+def parse_time(time_str):
     """
-    Parses a response text to extract structured data when JSON decoding fails.
-    This is a simple implementation and may need to be tailored based on your LLM's output.
+    Parses time string into a timezone-aware datetime object.
     """
     try:
-        # Find the start of the JSON object
-        json_start = response_text.find('{')
-        if json_start == -1:
-            print("No JSON object found in the response.")
-            return {}
+        # Parse the ISO format time string with timezone information
+        return datetime.datetime.fromisoformat(time_str)
+    except ValueError as ve:
+        print(f"Time parsing error: {ve}")
+        raise
 
-        json_str = response_text[json_start:]
-        # Remove any trailing characters after the JSON object
-        json_end = json_str.rfind('}') + 1
-        json_str = json_str[:json_end]
-
-        data = json.loads(json_str)
-        return data
-    except Exception as e:
-        print(f"Error parsing text response: {e}")
-        return {}
-
-# Function to generate clarifying questions
-def generate_clarifying_questions(transcript_obj, task_details):
+def add_event_to_calendar(service, task_details):
     """
-    Uses the LLM to generate contextual and meaningful clarifying questions 
-    based on missing task details and inferred context.
+    Adds an event to Google Calendar without checking for conflicts.
     """
-    # Identify missing or ambiguous fields
-    existing_fields = task_details.keys()
-    prompt = (
-        f"The extracted task details are incomplete or ambiguous:\n"
-        f"{json.dumps(task_details, indent=2)}\n\n"
-        "Please generate clarifying questions to gather more information "
-        "about the task. These questions should help make the event more detailed"
-        "Return the questions as a JSON array. Do not include any explanations."
-    )
-
     try:
-        print("Generating clarifying questions with LLM...")
-        result = transcript_obj.lemur.task(
-            prompt, final_model=aai.LemurModel.claude3_5_sonnet
-        )
-        print("Raw LLM Clarifying Questions Response:", result.response)
+        task = task_details.get("task", "No task specified")
+        with_whom = task_details.get("with_whom", "Not specified")
+        time_str = task_details.get("time", None)
 
-        # Parse the JSON response
-        questions = json.loads(result.response)
-        return questions if isinstance(questions, list) else []
+        if not time_str:
+            print("No time provided for the event.")
+            return
+
+        start_time = parse_time(time_str)
+        # Assuming a default duration of 1 hour if not specified
+        end_time = start_time + datetime.timedelta(hours=1)
+
+        # Define the event with timezone-aware datetime objects
+        event = {
+            'summary': task,
+            'description': f"With: {with_whom}",
+            'start': {
+                'dateTime': start_time.isoformat(),
+                'timeZone': str(start_time.tzinfo) if start_time.tzinfo else 'UTC',
+            },
+            'end': {
+                'dateTime': end_time.isoformat(),
+                'timeZone': str(end_time.tzinfo) if end_time.tzinfo else 'UTC',
+            },
+        }
+
+        created_event = service.events().insert(calendarId='primary', body=event).execute()
+        print(f"Event created: {created_event.get('htmlLink')}")
     except Exception as e:
-        print("Failed to generate clarifying questions:", e)
-        return []
+        print(f"Error adding event to calendar: {e}")
 
-# Function to dynamically update task details
-def answer_clarifying_questions(questions):
+def display_upcoming_events(service, max_results=10):
     """
-    Asks the user the clarifying questions generated by the LLM.
-    Dynamically updates the task_details dictionary with new fields.
+    Displays upcoming events from Google Calendar.
     """
-    answers = {}
-    for question in questions:
-        # Ask the user for input
-        answer = input(f"{question.strip()} ").strip()
+    try:
+        print("\nYour Upcoming Events:")
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=now,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        events = events_result.get('items', [])
 
-        # Dynamically infer the key from the question
-        inferred_key = None
-        if "time" in question.lower():
-            inferred_key = "time"
-        elif "where" in question.lower():
-            inferred_key = "location"
-        elif "participants" in question.lower() or "who" in question.lower():
-            inferred_key = "participants"
-        elif "purpose" in question.lower() or "agenda" in question.lower():
-            inferred_key = "agenda"
-        elif "duration" in question.lower() or "how long" in question.lower():
-            inferred_key = "duration"
+        if not events:
+            print("No upcoming events found.")
+            return
 
-        # If a key is inferred, update the answers dictionary
-        if inferred_key:
-            answers[inferred_key] = answer
-        else:
-            # If no key is inferred, use a generic key
-            answers[f"custom_field_{len(answers)+1}"] = answer
+        for event in events:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            print(f"- {event['summary']} at {start}")
+    except Exception as e:
+        print(f"Error fetching upcoming events: {e}")
 
-    return answers
-
-# Function to create a polished calendar-like event
-def create_calendar_event(task_details):
-    """
-    Constructs a clean and detailed calendar event.
-    """
-    task = task_details.get("task", "No task specified")
-    with_whom = task_details.get("with_whom", "Not specified")
-    time = task_details.get("time", "No time provided")
-    location = task_details.get("location", "Not specified")
-    participants = task_details.get("participants", "Not specified")
-    agenda = task_details.get("agenda", "Not specified")
-    duration = task_details.get("duration", "Not specified")
-
-    # Create a detailed calendar event string
-    event = (
-        f"\n=== Calendar Event ===\n"
-        f"Task: {task}\n"
-        f"With: {with_whom}\n"
-        f"Time: {time}\n"
-        f"Location: {location}\n"
-        f"Participants: {participants}\n"
-        f"Agenda: {agenda}\n"
-        f"Duration: {duration}\n"
-        f"======================"
-    )
-    return event
-
-# Main Function
-def main(audio_url):
+def main(audio_file_path):
     # Step 1: Transcribe audio
-    transcript_obj = transcribe_audio(audio_url)
+    transcript_obj = transcribe_audio(audio_file_path)
     if not transcript_obj:
         print("Failed to transcribe audio.")
         return
 
-    print(f"\nTranscript:\n{transcript_obj.text}")
+    transcript_text = transcript_obj.text
+    print(f"\nTranscript:\n{transcript_text}")
 
     # Step 2: Extract task details using LLM
-    task_details = extract_task_details_llm(transcript_obj)
+    task_details = extract_task_details_llm(transcript_text)
     if not task_details:
         print("Failed to extract task details.")
         return
 
     print("\nExtracted Task Details:")
-    print(task_details)
+    print(json.dumps(task_details, indent=2))
 
-    # Step 3: Generate clarifying questions
-    questions = generate_clarifying_questions(transcript_obj, task_details)
-    if questions:
-        print("\nClarifying Questions:")
-        for question in questions:
-            print(f"- {question}")
+    # Step 3: Authenticate with Google Calendar
+    service = authenticate_google_calendar()
 
-        # Step 4: Answer clarifying questions
-        answers = answer_clarifying_questions(questions)
-        task_details.update(answers)
+    # Step 4: Add event to calendar without conflict checking
+    add_event_to_calendar(service, task_details)
 
-    print("\nUpdated Task Details:")
-    print(task_details)
+    # Step 5: Display updated schedule
+    display_upcoming_events(service)
 
-    # Step 5: Create a polished calendar event
-    calendar_event = create_calendar_event(task_details)
-    print(calendar_event)
-
-# Example Usage
 if __name__ == "__main__":
-    # List of audio files to process
-    audio_files = ["audio.wav"]
-    
-    for audio_file in audio_files:
-        print(f"\nProcessing file: {audio_file}\n{'='*30}")
-        main(audio_file)
+    # Example Usage
+    # Replace 'your_audio_file.wav' with the actual path to your local audio file
+    audio_file_path = "audio.wav"
+    main(audio_file_path)
